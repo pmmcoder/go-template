@@ -1,0 +1,19 @@
+# 基础配置（所有环境共享）
+app:
+  name: my_project
+  env: dev
+  port: 8080
+
+db:
+  dsn: postgres://postgres:123456@127.0.0.1:5432/my_project?sslmode=disable
+  max_open_conns: 25
+  max_idle_conns: 5
+
+queue:
+  max_workers: 10
+  poll_time: 5
+
+cache:
+  addr: localhost:6379
+  password: ""
+  db: 0
