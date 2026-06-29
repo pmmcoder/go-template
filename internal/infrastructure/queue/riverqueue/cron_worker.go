@@ -1,4 +1,4 @@
-package queue
+package riverqueue
 
 import (
 	"context"
@@ -7,21 +7,19 @@ import (
 	"sync"
 	"time"
 
+	"my_project/internal/infrastructure/queue/contract"
+
 	"github.com/riverqueue/river"
-	"github.com/riverqueue/river/rivertype"
 	"github.com/robfig/cron/v3"
 )
 
 // CronQueue cron 任务使用的 river job kind。
 const CronQueue = "cron"
 
-type CronTaskHandler func(ctx context.Context) error
-
 // CronJobArgs cron 周期任务参数。与 TaskJobArgs 字段相同但 Kind 不同，
 // 从而由独立的 CronWorker 处理，便于对周期任务单独配置队列/重试等策略。
 type CronJobArgs struct {
 	TaskType string `json:"task_type"` // cron 任务类型，分发到对应 handler
-	Payload  string `json:"payload"`   // 任务负载
 }
 
 // Kind 实现 river.JobArgs。
@@ -35,7 +33,7 @@ type CronWorker struct {
 	logger *slog.Logger
 
 	mu       sync.RWMutex
-	handlers map[string]CronTaskHandler
+	handlers map[string]contract.CronTaskHandler
 }
 
 // NewCronWorker 创建 cron worker。
@@ -43,11 +41,11 @@ func NewCronWorker(logger *slog.Logger) *CronWorker {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CronWorker{logger: logger, handlers: make(map[string]CronTaskHandler)}
+	return &CronWorker{logger: logger, handlers: make(map[string]contract.CronTaskHandler)}
 }
 
 // RegisterHandler 注册 cron 任务处理器（并发安全，可在 Start 前后调用）。
-func (w *CronWorker) RegisterHandler(taskType string, handler CronTaskHandler) {
+func (w *CronWorker) RegisterHandler(taskType string, handler contract.CronTaskHandler) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.handlers[taskType] = handler
@@ -83,35 +81,6 @@ func (w *CronWorker) Work(ctx context.Context, job *river.Job[CronJobArgs]) erro
 		"duration", time.Since(start),
 	)
 	return nil
-}
-
-// --- 周期任务调度 ---
-
-// CronHandle 周期任务句柄，由 RegisterCron 返回，可用于 RemoveCron 移除。
-type CronHandle rivertype.PeriodicJobHandle
-
-// CronOption 配置周期任务。
-type CronOption func(*cronConfig)
-
-type cronConfig struct {
-	opts       river.PeriodicJobOpts
-	insertOpts []SubmitOption
-}
-
-// CronRunOnStart 启动（或动态注册）时立即插入一次任务，之后按计划运行。
-// 适用于长间隔任务的兜底，避免因进程重启丢失运行窗口。
-func CronRunOnStart() CronOption {
-	return func(c *cronConfig) { c.opts.RunOnStart = true }
-}
-
-// CronWithID 设置周期任务唯一标识。同 ID 重复注册会返回错误。
-func CronWithID(id string) CronOption {
-	return func(c *cronConfig) { c.opts.ID = id }
-}
-
-// CronWithInsertOpts 为每次入队任务附加提交选项（如优先级、最大尝试次数）。
-func CronWithInsertOpts(opts ...SubmitOption) CronOption {
-	return func(c *cronConfig) { c.insertOpts = append(c.insertOpts, opts...) }
 }
 
 // CronInterval 构造固定间隔的调度计划。

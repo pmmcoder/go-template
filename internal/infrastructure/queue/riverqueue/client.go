@@ -1,4 +1,4 @@
-package queue
+package riverqueue
 
 import (
 	"context"
@@ -18,6 +18,8 @@ type Config struct {
 	Queues             map[string]int // 队列名称 -> 并发数配置，nil 时使用默认
 	Workers            *river.Workers // 已注册 worker 的集合（处理任务必填，仅插入可省略）
 	Logger             *slog.Logger   // 日志记录器
+	JobTimeout         int            // job 运行的超时时间（单位：分钟），<=0 由上层使用默认值
+	MaxAttempts        int            // job 失败后最大尝试次数（含首次执行）
 	AdvisoryLockPrefix int32          // 咨询锁前缀（多租户隔离用）
 }
 
@@ -42,8 +44,8 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	driver := riverpgxv5.New(pool)
 
 	riverCfg := &river.Config{
-		JobTimeout:  10 * time.Minute,
-		MaxAttempts: 5,
+		JobTimeout:  time.Duration(cfg.JobTimeout) * time.Minute,
+		MaxAttempts: cfg.MaxAttempts,
 	}
 	if cfg.Workers != nil {
 		riverCfg.Workers = cfg.Workers

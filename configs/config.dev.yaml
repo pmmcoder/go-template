@@ -12,6 +12,8 @@ db:
 queue:
   max_workers: 10
   poll_time: 5
+  job_timeout: 10
+  max_attempts: 5
 
 cache:
   addr: localhost:6379

@@ -1,0 +1,211 @@
+Code Review 报告：internal/infrastructure/queue (River 队列实现)
+总体评估
+封装思路是合理的：将 river 抽象成 Queue 接口、用统一 TaskJobArgs.TaskType 分发处理器、隔离 cron/普通任务到不同 worker。但当前实现存在 多个会在生产环境直接出问题的 bug（数据竞争、协程崩溃、消息丢失、handler 错误删除），以及若干架构层面的耦合问题。整体处于"能跑通单机 happy path、上生产前必须修"的状态。
+
+P0 — 必修（会导致正确性 / 数据问题）
+1. GetQueue() 严重的数据竞争与逻辑错误 — queue.go:319-329
+
+var tmpNum = 1 // 测试代码
+
+func (q *riverQueue) GetQueue() string {
+    if tmpNum > 1000 { return "2" }
+    tmpNum++
+    return "5"
+}
+包级全局可变变量、无任何锁保护 → Submit 高并发时 data race（go test -race 必报）。
+注释自标"测试代码"，却被 Submit 在生产路径默认调用 (queue.go:196-198)。
+语义是"前 1000 次走队列 5，之后永远走队列 2"，这既不是负载均衡也不是动态并发控制。
+队列名 "2"、"5" 把并发数当成了队列名（queue.go:35-39），后续无法语义化扩展。
+建议：要么删除动态队列逻辑、由调用方显式 WithQueue；要么实现真正的策略（按 taskType 路由、按租户哈希分布等）并用 atomic 或独立的策略对象封装。
+
+2. CleanJob 在多实例部署下会破坏其他实例正在执行的任务 — queue.go:119-134
+
+UPDATE river_job SET state = 'available', attempted_at = NULL WHERE state = 'running'
+无 host/worker 过滤，会把其他实例正在执行的 job 重置为 available，导致重复执行。
+River 自带 Rescuer 机制（基于 attempted_at 超时），应直接启用而非自实现。
+使用 fmt.Printf 而非 logger；""+ "UPDATE ..." 的字符串拼接是死代码。
+3. Listener channel 关闭后 panic — listener_worker.go:53-79
+
+case event := <-l.receiveChan:
+    jobID := event.Job.ID   // event 为 nil 时 panic
+当 river 关闭/取消订阅，channel 关闭后 event 为 nil，访问 event.Job.ID → nil pointer panic。recover 虽然保护了进程，但 listener 自此停摆、所有 hook/listener 静默死亡。
+
+修复：
+
+
+case event, ok := <-l.receiveChan:
+    if !ok { return }
+4. Listener handler 在 Failed 事件下被错误删除 — listener_worker.go:76-78
+
+if ok {
+    handler(ctx, event)
+    delete(l.handlers, jobID)   // ← 任何事件都删
+}
+River 订阅了 EventKindJobCompleted + EventKindJobFailed (queue.go:159-162)，一个 job 重试期间会多次发 Failed。第一次 Failed 后 handler 即被删除，后续真正完成的 Completed 事件就再没人监听 → 业务上游永远收不到"成功"通知。
+
+修复：仅在终止态（Completed/Discarded）删除；或让 handler 自行决定是否完成。
+
+5. JobHook.InsertBegin 永远拿不到正确 JobID — hook.go:37-43
+
+func (j JobHook) InsertBegin(ctx context.Context, job *rivertype.JobInsertParams) error {
+    j.notify(ctx, HookData{Status: StatusAvailable, Data: ...})  // JobID 字段没赋值，默认 0
+}
+notify 用 message.JobID 去查 hookChan (hook.go:77)，而 InsertBegin 阶段：
+
+HookData.JobID 没赋值 → 是 0；
+即便赋值，调用方一般还没拿到 jobID 去 RegisterHookChan → channel 也不存在。
+→ InsertBegin 的 hook 消息 100% 被丢弃。
+
+6. Hook channel 满时静默丢消息 — hook.go:82-87
+
+select {
+case hookChan <- message:
+default:
+    fmt.Printf("JobHook.notify.channel channel full \n")
+}
+业务侧依据状态机推进时，丢一条 Running 或 Success 就会卡死消费者。生产环境必须要么阻塞（带 ctx 超时），要么有 metric 暴露丢弃数。
+
+7. Init 失败后无法重试 — queue.go:340-346
+
+globalOnce.Do(func() {
+    q, err := New(ctx, defaultConfig())
+    globalQueue, globalErr = q, err
+})
+return globalErr
+sync.Once 经典反模式：首次 New 失败（DB 暂未就绪），globalErr 永久缓存错误，进程后续每次 Init() 永远返回旧 error，必须重启进程。
+
+修复：失败时不消费 once，或用 sync.OnceValue 之外的可重试封装。
+
+8. CronTaskHandler 拿不到 Payload — cron_worker.go:18, 57-79
+
+type CronTaskHandler func(ctx context.Context) error
+但 CronJobArgs.Payload 存在并被序列化进 DB (cron_worker.go:24)，handler 签名却没有 payload 参数 → 写进去的 payload 永远读不到。要么删除 Payload 字段，要么改签名为 func(ctx, payload string) error。
+
+P1 — 高优先级（设计/可维护性硬伤）
+9. Hook 强依赖全局单例 — hook.go:77
+
+hookChan := globalQueue.GetHookChan(message.JobID)
+queue.New 创建的非全局实例所有 hook 都会写到 globalQueue → 测试和多实例场景串号。
+单元测试无法 mock。
+修复：Hook 创建时持有 Queue 引用（构造期注入）：&JobHook{q: q}。
+
+10. RegisterHookChan / GetHookChan 命名与方向混乱 — queue.go:276-307
+RegisterHookChan 返回 <-chan（消费端），但其实是"创建并注册"。
+GetHookChan 返回 chan<-（生产端），但不会创建，只在已注册时返回。
+包级 GetHookChan 实际调用的是 RegisterHookChan (queue.go:465-472)。
+这种命名让人无法只看签名判断行为。建议改名为 SubscribeHook(jobID) <-chan HookData 与 notifyHook(jobID, data)。
+
+11. Hook channel 内存泄漏
+hookListener 仅靠调用方主动 RemoveHookChan 清理。任何遗漏（panic、timeout、提前 return）都会泄漏一个 channel + 一个 buffered 100 slot。无 TTL、无 LRU、无 jobID 终态自动清理。
+
+修复：监听 job 终态事件（结合 Listener）自动 close + delete。
+
+12. 接口职责过载，违反 SRP — queue.go:42-73
+Queue 接口包含 14 个方法，覆盖：任务提交、Worker 注册、Cron 管理、Listener 管理、Hook 管理、生命周期管理、动态队列选择。架构师视角建议拆分：
+
+
+JobSubmitter / HandlerRegistry / CronScheduler / EventBus / Lifecycle
+riverQueue 依旧可以实现所有接口，但外部依赖可只接收需要的小接口（如 service 层只依赖 JobSubmitter）。
+
+13. WithSchedule 静默忽略过去时间 — queue.go:89-95
+
+func WithSchedule(timer time.Time) SubmitOption {
+    return func(o *river.InsertOpts) {
+        if timer.After(time.Now()) { o.ScheduledAt = timer }
+    }
+}
+传入过去时间 → 选项变成 no-op → 调用方以为是定时执行、实际立即执行，无任何错误/日志。应改为 Submit 返回 error，或文档明确"≤now 表示立即执行"。
+
+14. Listener 生命周期与传入 ctx 不匹配 — queue.go:159-164
+
+listener := NewListener(cfg.Logger, listenerChan)
+listener.start(ctx)   // 用的是 New 的 ctx，通常是 init 短上下文
+如果调用方传的是带 timeout 的 ctx，listener goroutine 会在 ctx 超时后退出 → 整个事件系统静默死亡。应使用 context.Background() 派生独立 ctx，并在 Stop() 时显式 cancel。
+
+15. Listener 缓冲不可配、缺失事件类型过滤
+client.Client.Subscribe 默认 buffer 1000，channel 满后 river 会丢事件。
+handler 不能区分事件类型（Completed vs Failed）。
+应改用 SubscribeConfig 让调用方控制 buffer，并在注册时声明感兴趣的事件类型。
+P2 — 中等优先级
+16. 测试 TestQueue 是无限循环 — workder_test.go:140-181
+for {} 无终止条件，defer Close()/Stop() 永远不执行；没有任何 assertion。这不是测试，是 demo。应放到 cmd/ 下作为手动验证程序，或加 deadline + 断言 handler 被调用次数。
+
+17. 文件名拼写错误：workder_test.go → worker_test.go
+18. 生产代码混入 fmt.Printf/Println — listener_worker.go:51,62, hook.go:84,86, queue.go:130
+都应改用注入的 slog.Logger，便于结构化日志/采样/级别控制。
+
+19. River 配置硬编码 — client.go:44-47
+
+JobTimeout: 10 * time.Minute,
+MaxAttempts: 5,
+写死在代码里。建议加入 Config 字段，并在 defaultConfig 从 config.MConfig.Queue 读取。
+
+20. Pool() 破坏封装 — client.go:92-94
+返回原始 *pgxpool.Pool，调用方可绕过 Queue 抽象做任何事。注释说"用于迁移等管理操作"，应限定到迁移专用方法 Migrate(ctx) 而非裸暴露 pool。
+
+21. queueMap 全局可变 map — queue.go:35-39
+包级 var queueMap = map[string]int{...}：可被任意包修改（map 是引用类型），且没有文档说明 "2"、"5" 是队列名。应改为 defaultConfig 内构造，或从配置文件加载。
+
+22. AdvisoryLockPrefix 配置未使用 — client.go:21,59-61
+Config 字段定义了，但 defaultConfig 没设置。多租户/多实例同库共享场景下会冲突。
+
+23. 日志目录被纳入版本管理
+git status 显示大量 internal/infrastructure/queue/logs/app-*.log.gz 被 D。应加入 .gitignore，避免循环提交噪音。
+
+24. Hooks() 每次新建实例 — task_worker.go:29-34
+
+func (TaskJobArgs) Hooks() []rivertype.Hook {
+    return []rivertype.Hook{&JobHook{}}
+}
+每次入队/执行都 new。当前 JobHook 无状态影响不大，但一旦未来要做共享状态（如 metric counter）就会被坑。建议改为包级单例。
+
+25. JobHook 值接收者却在 slice 中放指针 — hook.go:37,45,54
+
+func (j JobHook) InsertBegin(...)  // 值接收者
+但接口断言 _ rivertype.HookInsertBegin = &JobHook{} 用的是指针。能 work 但风格不一致，统一为指针接收者更清晰。
+
+架构层建议
+Hook / Listener / Cron / Task 应是组合关系而非全部塞进 riverQueue：把 riverQueue 收敛到"组装器"角色，每个 sub-system 自治、可独立测试。
+
+观测性缺失：建议在 worker 包裹层加 Prometheus / OpenTelemetry：队列深度、jobs/s、p50/p95 延迟、失败率、retry 计数。River 提供 middleware/hook 钩子很自然。
+
+背压策略：当前没有任何入队限速。Submit 在 DB 慢时会成为应用层瓶颈，建议加入 Submit 侧的 token bucket / drop policy。
+
+运维入口：CleanJob、Cron 增删都应该有 HTTP/RPC 管理端点（带鉴权），而非依赖应用启动时硬编码。
+
+全局单例 vs 实例化 二选一：当前两套并存导致 hook 强绑全局。如果项目里只会有一个 queue 实例，砍掉 New 暴露；如果允许多实例，hook 必须持有实例引用。
+
+修复优先级建议
+优先级	项目	风险
+P0-立即	#1 GetQueue race, #2 CleanJob 跨实例, #3 listener nil panic, #4 handler 错删, #5 InsertBegin JobID=0, #6 hook 丢消息, #7 Init once bug, #8 cron payload 不可达	数据正确性、协程崩溃
+P1-本周	#9 hook 全局耦合, #10 命名混乱, #11 hookChan 泄漏, #12 接口拆分, #13/14/15 调度/生命周期	可维护性、生产故障定位
+P2-排期	#16-#25 测试/日志/配置/封装	代码卫生
+如需我直接动手修 P0，请指明从哪几条开始（建议先 #3 + #4 + #5 + #6，这四个是事件链路上的连锁 bug，修完才能信任 hook/listener 的语义）。
+
+
+
+
+
+修复情况：
+1.测试代码，最终是会固定值
+2.CleanJob是临时单机测试，正式环境依赖于river默认的清理机制
+3.已修复
+4.已修复，只会在complete时或者尝试次数用尽之后删除
+5.已知问题，实际使用message.jobID
+6.无影响
+7.已修复，初始化失败，服务不能启动
+8.已修复，删除Payload参数
+9.
+10.已修复
+11.暂不更改
+12.
+13.已修复，立即执行
+14.listener生命周期为服务一致，看是否修
+15.后续修复
+16.已知问题，不需要修复
+17.已修复
+18.调试阶段，咱不修复
+19.已修复
+20.暂不处理
+21.todo，后续更改
+22.以及后续咱不更改

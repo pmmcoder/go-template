@@ -61,8 +61,10 @@ type DBConfig struct {
 
 // QueueConfig 任务队列配置
 type QueueConfig struct {
-	MaxWorkers int `mapstructure:"max_workers"`
-	PollTime   int `mapstructure:"poll_time"`
+	MaxWorkers  int `mapstructure:"max_workers"`
+	PollTime    int `mapstructure:"poll_time"`
+	MaxAttempts int `mapstructure:"max_attempts"`
+	JobTimeout  int `mapstructure:"job_timeout"`
 }
 
 // CacheConfig 缓存配置
