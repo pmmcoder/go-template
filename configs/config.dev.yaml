@@ -1,8 +1,7 @@
-# 基础配置（所有环境共享）
 app:
   name: my_project
   env: dev
-  port: 8080
+  port: 8081
 
 db:
   dsn: postgres://postgres:123456@127.0.0.1:5432/my_project?sslmode=disable
@@ -19,3 +18,13 @@ cache:
   addr: localhost:6379
   password: ""
   db: 0
+
+ai:
+  retry:
+  endpoints:
+    - name: openai
+      models:
+        - openai
+      config:
+        api_key: xxx
+        base_url: https://xxx

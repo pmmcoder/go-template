@@ -12,6 +12,11 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+const (
+	TaskTypeAi   = "ai_task"
+	TaskTypeCron = "cron_task"
+)
+
 // 全局单例，供包级 facade 函数使用。
 var (
 	globalOnce  sync.Once
