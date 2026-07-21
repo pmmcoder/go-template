@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"my_project/internal/infrastructure/queue/contract"
 	"net/http"
 	_ "net/http/pprof" // 匿名导入自动注册pprof路由
 	"os"
@@ -66,7 +67,7 @@ func startServiceInit(ctx context.Context) {
 		os.Exit(1)
 	}
 
-	if err := RegisterHandler("email", func(ctx context.Context, payload string) error {
+	if err := RegisterHandler("email", func(ctx context.Context, payload string, runtimeArgs contract.RuntimeArgs) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

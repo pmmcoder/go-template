@@ -8,194 +8,171 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"my_project/internal/domain/task"
+	"my_project/internal/domain/scheduler"
+	"my_project/internal/infrastructure/external/ai/constants"
+	"my_project/internal/infrastructure/queue"
 )
 
-// Scheduler 实现 task.AIProvider，对 application 层透明。
-//
-// 职责：
-//  1. 路由：按 req.Model 选匹配的端点，无匹配回落到兜底端点（Models 为空）
-//  2. 加权选择：候选集合内按 Endpoint.Weight 加权随机
-//  3. 并发控制：每个端点维护一个 semaphore，满载时跳过该端点（不阻塞）
-//  4. 重试：可重试错误在单端点内按指数退避重试 RetryConfig.MaxAttempts 次
-//  5. 故障转移：当前端点失败（或满载）后，按权重换下一个端点；fatal 错误直接返回
+// Scheduler 装配调度层：把共享队列注册进 QueueManager，
+// 并在队列 worker 取到任务时按 model_capability 路由 + 端点加权选择。
 type Scheduler struct {
-	endpoints []*runtime
-	retry     RetryConfig
-	logger    *slog.Logger
+	logger        *slog.Logger
+	schedulerRepo scheduler.Repository
 }
 
-type runtime struct {
-	ep  Endpoint
-	sem chan struct{} // nil 表示不限并发
+// NewScheduler 构造调度器。
+func NewScheduler(log *slog.Logger, repo scheduler.Repository) (*Scheduler, error) {
+	return &Scheduler{logger: log, schedulerRepo: repo}, nil
 }
 
-// NewScheduler 装配调度器。endpoints 为空将返回错误。
-func NewScheduler(endpoints []Endpoint, retry RetryConfig, logger *slog.Logger) (*Scheduler, error) {
-	if len(endpoints) == 0 {
-		return nil, errors.New("ai scheduler: at least one endpoint required")
-	}
-	if logger == nil {
-		logger = slog.Default()
-	}
-	rts := make([]*runtime, len(endpoints))
-	for i, ep := range endpoints {
-		var sem chan struct{}
-		if ep.MaxInflight > 0 {
-			sem = make(chan struct{}, ep.MaxInflight)
-		}
-		rts[i] = &runtime{ep: ep, sem: sem}
-	}
-	return &Scheduler{
-		endpoints: rts,
-		retry:     retry.normalize(),
-		logger:    logger,
-	}, nil
+func (s *Scheduler) Name() string {
+	return "Scheduler"
 }
 
-func (s *Scheduler) Name() string { return "scheduler" }
-
-// Invoke 路由 + 故障转移：每个候选端点至多尝试一次（端点内自身可重试 MaxAttempts 次）。
-func (s *Scheduler) Invoke(ctx context.Context, req task.AIRequest) (*task.AIResult, error) {
-	candidates := s.match(req.Model)
-	if len(candidates) == 0 {
-		return nil, &task.AIError{
-			Code:    task.ErrCodeInvalidRequest,
-			Message: fmt.Sprintf("no endpoint matches model %q (and no fallback configured)", req.Model),
-			Vendor:  s.Name(),
-		}
+// Invoke 构造共享队列的分发闭包：按 model_capability 解析端点
+func (s *Scheduler) Invoke(ctx context.Context, params scheduler.AIRequest) (*scheduler.AIResult, error) {
+	if params.Model == "" {
+		return nil, fmt.Errorf("scheduler: queue %q task missing model_capability", queue.TaskTypeAi)
 	}
 
-	tried := make(map[*runtime]struct{}, len(candidates))
-	var lastErr error
-
-	for len(tried) < len(candidates) {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		r := pickWeighted(candidates, tried)
-		if r == nil {
-			break
-		}
-
-		if !r.tryAcquire() {
-			tried[r] = struct{}{}
-			s.logger.Debug("ai scheduler: endpoint at capacity, failover", "endpoint", r.ep.Name)
-			continue
-		}
-
-		result, err := s.invokeWithRetry(ctx, r, req)
-		r.release()
-
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-		tried[r] = struct{}{}
-
-		if isFatal(err) {
-			return nil, err
-		}
-		s.logger.Warn("ai scheduler: endpoint failed, failover",
-			"endpoint", r.ep.Name, "error", err)
+	eps, err := endpointsFor(ctx, s.schedulerRepo, params.Model)
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: load endpoints for task:%d capability %q: %w", params.TaskID, params.Model, err)
+	}
+	if len(eps) == 0 {
+		return nil, fmt.Errorf("scheduler: no enabled endpoint for task:%d capability %q", params.TaskID, params.Model)
 	}
 
-	if lastErr == nil {
-		lastErr = &task.AIError{
-			Code:    task.ErrCodeServer,
-			Message: "all candidate endpoints at capacity",
-			Vendor:  s.Name(),
-		}
+	ep, pool, err := s.acquireEndpoint(eps)
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	if pool != nil {
+		defer pool.Release()
+	}
+
+	// 超时决策 + 过程日志：可观察 p95/失败数/在途并发是否正常。
+	w := windowFor(ep.Key())
+	timeout := timeoutFor(ep, w)
+	nOK, p95, _ := w.stats()
+	cur, size := int64(-1), int64(-1)
+	if pool != nil {
+		cur, size = pool.GetState()
+	}
+	s.logger.Info("scheduler: dispatching",
+		"queue", queue.TaskTypeAi, "taskID", params.TaskID, "capability", params.Model,
+		"platform", ep.Platform, "account", ep.Account, "gateKey", ep.GateKey,
+		"timeout", timeout, "dynamic", ep.Dynamic,
+		"timeoutFailures", w.failures(), "successSamples", nOK, "p95Sec", p95,
+		"inflight", cur, "maxInflight", size)
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	start := time.Now()
+	res, genErr := callWithTimeout(ctx, ep.Model, params.ModelOpt)
+	elapsed := time.Since(start)
+	switch {
+	case genErr == nil:
+		recordSuccess(ep.Key(), elapsed)
+		s.logger.Info("scheduler: generate ok", "taskID", params.TaskID,
+			"capability", params.Model, "platform", ep.Platform, "account", ep.Account,
+			"elapsed", elapsed, "res", res)
+	case errors.Is(genErr, context.DeadlineExceeded):
+		// 仅超时类失败计入失败窗口（错误收敛）：它们才与超时松紧相关。
+		recordTimeout(ep.Key())
+		s.logger.Warn("scheduler: generate timeout", "taskID", params.TaskID,
+			"capability", params.Model, "platform", ep.Platform, "account", ep.Account,
+			"elapsed", elapsed, "timeout", timeout, "res", res)
+	default:
+		recordError(ep.Key())
+		s.logger.Warn("scheduler: generate error", "taskID", params.TaskID,
+			"capability", params.Model, "platform", ep.Platform, "account", ep.Account,
+			"elapsed", elapsed, "error", genErr, "res", res)
+	}
+	return &scheduler.AIResult{
+		TaskID:       res.TaskID,
+		UserID:       res.UserID,
+		Platform:     res.Platform,
+		Account:      res.Account,
+		Content:      res.Content,
+		Model:        res.Model,
+		FinishReason: res.Error,
+	}, genErr
 }
 
-// match 按模型筛选候选端点；无精确匹配时回落到兜底端点（Models 为空者）。
-func (s *Scheduler) match(model string) []*runtime {
-	var exact, fallback []*runtime
-	for _, r := range s.endpoints {
-		if len(r.ep.Models) == 0 {
-			fallback = append(fallback, r)
-			continue
-		}
-		for _, m := range r.ep.Models {
-			if m == model {
-				exact = append(exact, r)
-				break
+type outContent struct {
+	SchedulerResp constants.SchedulerResp
+	Err           error
+}
+
+// callWithTimeout 执行 Generate
+func callWithTimeout(ctx context.Context, m Model, params map[string]interface{}) (constants.SchedulerResp, error) {
+	done := make(chan outContent, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- outContent{constants.SchedulerResp{}, fmt.Errorf("scheduler: model panic: %v", r)}
 			}
-		}
+		}()
+		res, err := m.Generate(ctx, params)
+		done <- outContent{res, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return constants.SchedulerResp{}, fmt.Errorf("scheduler: generate timeout: %w", ctx.Err())
+	case output := <-done:
+		return output.SchedulerResp, output.Err
 	}
-	if len(exact) > 0 {
-		return exact
-	}
-	return fallback
 }
 
-// pickWeighted 在未尝试过的候选中按权重随机抽取一个。
-// 总权重为 0（候选全在 exclude 中）时返回 nil。
-func pickWeighted(candidates []*runtime, exclude map[*runtime]struct{}) *runtime {
-	total := 0
-	for _, r := range candidates {
-		if _, skip := exclude[r]; skip {
-			continue
+// acquireEndpoint 在候选端点里选一个并占用其并发槽。
+func (s *Scheduler) acquireEndpoint(eps []Endpoint) (Endpoint, *Pool, error) {
+	avail := make([]Endpoint, len(eps))
+	copy(avail, eps)
+	for len(avail) > 0 {
+		i := weightedIndex(avail)
+		if i < 0 {
+			break // 兜底：权重恒 ≥1 时不会发生，仅防御空/零权重导致的死循环
 		}
-		total += r.ep.Weight
+		ep := avail[i]
+		pool := gateFor(ep.GateKey)
+		if pool == nil { // 不限并发
+			s.logger.Debug("scheduler: endpoint has no inflight limit", "ep", ep.Key().String(), "gateKey", ep.GateKey)
+			return ep, nil, nil
+		}
+		if pool.TryAcquire() == nil {
+			cur, size := pool.GetState()
+			s.logger.Debug("scheduler: acquired slot",
+				"ep", ep.Key().String(), "gateKey", ep.GateKey, "inflight", cur, "maxInflight", size)
+			return ep, pool, nil
+		}
+		// 该端点满载：剔除后在其余端点里重新加权
+		s.logger.Debug("scheduler: endpoint saturated, trying others", "ep", ep.Key().String(), "gateKey", ep.GateKey)
+		avail = append(avail[:i], avail[i+1:]...)
+	}
+
+	s.logger.Warn("scheduler: all endpoints saturated, rejecting",
+		"capability", eps[0].Capability, "endpoints", len(eps))
+	return Endpoint{}, nil, constants.ErrEndpointsSaturated
+}
+
+// weightedIndex 在端点集合内按 Weight 加权随机返回一个下标；总权重为 0 时返回 -1。
+func weightedIndex(eps []Endpoint) int {
+	total := 0
+	for i := range eps {
+		total += eps[i].Weight
 	}
 	if total <= 0 {
-		return nil
+		return -1
 	}
 	n := rand.IntN(total)
-	for _, r := range candidates {
-		if _, skip := exclude[r]; skip {
-			continue
-		}
-		n -= r.ep.Weight
+	for i := range eps {
+		n -= eps[i].Weight
 		if n < 0 {
-			return r
+			return i
 		}
 	}
-	return nil
-}
-
-// invokeWithRetry 在单端点上按 RetryConfig 重试。
-func (s *Scheduler) invokeWithRetry(ctx context.Context, r *runtime, req task.AIRequest) (*task.AIResult, error) {
-	var lastErr error
-	for attempt := 1; attempt <= s.retry.MaxAttempts; attempt++ {
-		result, err := r.ep.Provider.Invoke(ctx, req)
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-		if !isRetryable(err) || attempt == s.retry.MaxAttempts {
-			return nil, err
-		}
-		d := backoff(s.retry, attempt)
-		s.logger.Debug("ai scheduler: retrying",
-			"endpoint", r.ep.Name, "attempt", attempt, "delay", d, "error", err)
-		select {
-		case <-time.After(d):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	return nil, lastErr
-}
-
-func (r *runtime) tryAcquire() bool {
-	if r.sem == nil {
-		return true
-	}
-	select {
-	case r.sem <- struct{}{}:
-		return true
-	default:
-		return false
-	}
-}
-
-func (r *runtime) release() {
-	if r.sem == nil {
-		return
-	}
-	<-r.sem
+	return -1
 }

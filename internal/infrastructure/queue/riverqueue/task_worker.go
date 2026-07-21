@@ -78,7 +78,12 @@ func (w *TaskWorker) Work(ctx context.Context, job *river.Job[TaskJobArgs]) erro
 		return fmt.Errorf("unknown task type: %s", args.TaskType)
 	}
 
-	if err := handler(ctx, args.Payload); err != nil {
+	runtimeArgs := contract.RuntimeArgs{
+		Attempt:     job.Attempt,
+		MaxAttempts: job.MaxAttempts,
+	}
+
+	if err := handler(ctx, args.Payload, runtimeArgs); err != nil {
 		w.logger.Error("task job failed",
 			"task_type", args.TaskType,
 			"attempt", job.Attempt,
@@ -166,7 +171,14 @@ func (j *JobHook) WorkEnd(ctx context.Context, job *rivertype.JobRow, interErr e
 		return nil
 	}
 
-	hookData := contract.HookData{JobID: taskID}
+	hookData := contract.HookData{
+		JobID: taskID,
+		IsEnd: true,
+		RuntimeArgs: contract.RuntimeArgs{
+			Attempt:     job.Attempt,
+			MaxAttempts: job.MaxAttempts,
+		},
+	}
 	if interErr != nil {
 		hookData.ErrMsg = interErr.Error()
 		if job.Attempt >= job.MaxAttempts {
@@ -180,7 +192,7 @@ func (j *JobHook) WorkEnd(ctx context.Context, job *rivertype.JobRow, interErr e
 
 	hookData.Data = fmt.Sprintf("JobHook.WorkEnd task_id:%d status:%d attempt:%d/%d", taskID, hookData.Status, job.Attempt, job.MaxAttempts)
 	j.notify(ctx, hookData)
-	return nil
+	return interErr
 }
 
 func (j *JobHook) notify(_ context.Context, message contract.HookData) {

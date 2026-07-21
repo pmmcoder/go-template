@@ -1,4 +1,4 @@
-// Package persistence 提供 domain 层 Repository 接口的 PostgreSQL 实现。
+// Package gormdb persistence 提供 domain 层 Repository 接口的 PostgreSQL 实现。
 package gormdb
 
 import (
@@ -31,16 +31,22 @@ func (r *TaskRepo) Save(ctx context.Context, t *task.Task) error {
 		return fmt.Errorf("task repo: marshal messages: %w", err)
 	}
 
+	modelOpts, err := json.Marshal(s.ModelOpts)
+	if err != nil {
+		return fmt.Errorf("task repo: marshal modelOpts: %w", err)
+	}
+
 	m := models.Task{
-		ID:          s.ID,
-		Model:       s.Model,
-		Messages:    msgs,
-		Status:      int16(s.Status),
-		Content:     s.Content,
-		TotalTokens: s.TotalTokens,
-		ErrorMsg:    s.ErrorMsg,
-		CreatedAt:   s.CreatedAt,
-		UpdatedAt:   s.UpdatedAt,
+		ID:        s.ID,
+		UserID:    s.UserID,
+		Model:     s.Model,
+		ModelOpts: modelOpts,
+		Messages:  msgs,
+		Status:    int16(s.Status),
+		Content:   s.Content,
+		ErrorMsg:  s.ErrorMsg,
+		CreatedAt: s.CreatedAt,
+		UpdatedAt: s.UpdatedAt,
 	}
 
 	if s.ID == 0 {
@@ -55,11 +61,12 @@ func (r *TaskRepo) Save(ctx context.Context, t *task.Task) error {
 		Model(&models.Task{}).
 		Where("id = ?", s.ID).
 		Updates(map[string]any{
+			"user_id":       m.UserID,
 			"model":         m.Model,
+			"model_opts":    m.ModelOpts,
 			"messages":      m.Messages,
 			"status":        m.Status,
 			"content":       m.Content,
-			"total_tokens":  m.TotalTokens,
 			"error_message": m.ErrorMsg,
 			"updated_at":    m.UpdatedAt,
 		})
@@ -83,17 +90,20 @@ func (r *TaskRepo) FindByID(ctx context.Context, id int64) (*task.Task, error) {
 	}
 
 	s := task.State{
-		ID:          m.ID,
-		Model:       m.Model,
-		Status:      task.Status(m.Status),
-		Content:     m.Content,
-		TotalTokens: m.TotalTokens,
-		ErrorMsg:    m.ErrorMsg,
-		CreatedAt:   m.CreatedAt,
-		UpdatedAt:   m.UpdatedAt,
+		ID:        m.ID,
+		UserID:    m.UserID,
+		Model:     m.Model,
+		Status:    task.Status(m.Status),
+		Content:   m.Content,
+		ErrorMsg:  m.ErrorMsg,
+		CreatedAt: m.CreatedAt,
+		UpdatedAt: m.UpdatedAt,
 	}
 	if err := json.Unmarshal(m.Messages, &s.Messages); err != nil {
 		return nil, fmt.Errorf("task repo: unmarshal messages id=%d: %w", id, err)
+	}
+	if err := json.Unmarshal(m.ModelOpts, &s.ModelOpts); err != nil {
+		return nil, fmt.Errorf("task repo: unmarshal modelOpts id=%d: %w", id, err)
 	}
 	return task.Restore(s), nil
 }

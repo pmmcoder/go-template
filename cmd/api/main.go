@@ -14,7 +14,7 @@ import (
 	httpadapter "my_project/internal/adapters/http"
 	apptask "my_project/internal/application/task"
 	"my_project/internal/infrastructure/external/ai"
-	_ "my_project/internal/infrastructure/external/ai/bundle" // 触发 vendor 注册
+	_ "my_project/internal/infrastructure/external/ai/bundle"
 	gormdb "my_project/internal/infrastructure/persistence/gorm"
 	"my_project/internal/infrastructure/queue"
 	"my_project/pkg/config"
@@ -55,8 +55,9 @@ func main() {
 		}
 	}()
 
+	schedulerRepo := gormdb.NewSchedulerEndpointRepo(db)
 	// AI 调度器
-	sch, err := ai.NewFromConfig(config.MConfig.AI, log)
+	sch, err := ai.NewScheduler(log, schedulerRepo)
 	if err != nil {
 		panic(err)
 	}
@@ -74,10 +75,9 @@ func main() {
 	// 仓储
 	repo := gormdb.NewTaskRepo(db)
 
-	// application service（同时供 API 侧 Submit 和 worker 侧 HandleAITask 使用）
-	taskSvc := apptask.NewService(sch, repo)
+	// application service（同时供 API 侧 Submit & worker 使用）
+	taskSvc := apptask.NewService(repo, sch)
 
-	// 注册 worker 端 handler
 	if err := queue.RegisterHandler(queue.TaskTypeAi, taskSvc.HandleAITask); err != nil {
 		panic(err)
 	}

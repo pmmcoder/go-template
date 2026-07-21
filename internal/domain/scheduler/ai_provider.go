@@ -1,14 +1,12 @@
-package task
+package scheduler
 
-import "context"
+import (
+	"context"
+)
 
-// AIProvider 是 task 领域消费 AI 能力的端口。
-// 实现位于 internal/infrastructure/external/ai/<vendor>/，
-// 由 cmd 启动时按配置选型并注入到 application 层。
-type AIProvider interface {
-	// Name 返回实现标识（如 "openai" / "anthropic"），用于日志与可观测性。
+// AiProvider 是 task 领域消费 分发 能力的端口。
+type AiProvider interface {
 	Name() string
-	// Invoke 同步调用一次模型，输入输出均为统一协议。
 	Invoke(ctx context.Context, req AIRequest) (*AIResult, error)
 }
 
@@ -39,18 +37,13 @@ type AIRequest struct {
 
 // AIResult 统一返回协议。
 type AIResult struct {
-	Content      string      `json:"content"`                 // 模型输出文本
-	Model        string      `json:"model"`                   // 实际使用的模型名
-	FinishReason string      `json:"finish_reason,omitempty"` // stop / length / content_filter ...
-	Usage        AIUsage     `json:"usage"`                   // token 用量
-	Raw          interface{} `json:"-"`                       // 原始响应，仅排障用，禁止序列化外发
-}
-
-// AIUsage token 用量统计。
-type AIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	UserID       string `json:"user_id"`
+	TaskID       int64  `json:"task_id"`
+	Platform     string `json:"platform"`
+	Account      string `json:"account"`
+	Content      string `json:"content"`                 // 模型输出文本
+	Model        string `json:"model"`                   // 实际使用的模型名
+	FinishReason string `json:"finish_reason,omitempty"` // stop / length / content_filter ...
 }
 
 // AIError 统一错误，便于上层按 Code 做重试/降级判断。

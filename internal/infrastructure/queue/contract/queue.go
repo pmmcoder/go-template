@@ -36,13 +36,20 @@ type Queue interface {
 }
 
 type HookData struct {
-	JobID  int64       `json:"job_id"`
-	ErrMsg string      `json:"err_msg"`
-	Status int         `json:"status"`
-	Data   interface{} `json:"data"`
+	RuntimeArgs
+	JobID  int64  `json:"job_id"`
+	ErrMsg string `json:"err_msg"`
+	IsEnd  bool   `json:"is_end"`
+	Status int    `json:"status"`
+	Data   string `json:"data"`
 }
 
-type TaskHandler func(ctx context.Context, payload string) error
+type RuntimeArgs struct {
+	Attempt     int
+	MaxAttempts int
+}
+
+type TaskHandler func(ctx context.Context, payload string, runtimeArgs RuntimeArgs) error
 
 type CronHandle rivertype.PeriodicJobHandle
 
